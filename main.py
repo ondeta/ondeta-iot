@@ -22,7 +22,7 @@ LON_SIM = -47.882168
 DEVICE_ID = ubinascii.hexlify(network.WLAN().config("mac"), ":").decode()
 
 # --- Hardware ---
-gps = None if SIMULAR_GPS else UART(1, baudrate=9600, rx=16, tx=17)
+gps = None if SIMULAR_GPS else UART(0, baudrate=9600, rx=1, tx=0) # Conexão na entrada I2C-0 da BitDogLab
 led = Pin(13, Pin.OUT)
 btn = Pin(5, Pin.IN, Pin.PULL_UP)
 
