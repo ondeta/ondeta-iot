@@ -6,15 +6,15 @@ import ujson
 import urequests
 
 # --- Configuração ---
-WIFI_SSID = "NOME_DA_REDE"
-WIFI_PASSWORD = "SENHA"
-API_BASE = "http://IP_LOCAL:3000/vehicle-locations"
+WIFI_SSID = "nome"
+WIFI_PASSWORD = "senha"
+API_BASE = "https://ondeta-api.vercel.app/vehicle-locations"
 START_ROUTE_URL = API_BASE + "/start-route"
 TRACK_URL = API_BASE + "/track"
 INTERVALO_ENVIO_S = 30
 
 # True = usa coordenadas fixas abaixo; False = lê o módulo GPS real via UART
-SIMULAR_GPS = True
+SIMULAR_GPS = False
 LAT_SIM = -15.794228
 LON_SIM = -47.882168
 
@@ -22,7 +22,9 @@ LON_SIM = -47.882168
 DEVICE_ID = ubinascii.hexlify(network.WLAN().config("mac"), ":").decode()
 
 # --- Hardware ---
-gps = None if SIMULAR_GPS else UART(0, baudrate=9600, rx=1, tx=0) # Conexão na entrada I2C-0 da BitDogLab
+# Conexão na entrada I2C-0 da BitDogLab
+# rxbuf maior: durante o HTTPS o GPS continua enviando e o buffer padrão estoura
+gps = None if SIMULAR_GPS else UART(0, baudrate=9600, rx=1, tx=0, timeout=100, rxbuf=512)
 led = Pin(13, Pin.OUT)
 btn = Pin(5, Pin.IN, Pin.PULL_UP)
 
@@ -31,6 +33,16 @@ estado = False
 ultimo_estado_btn = 1
 ultimo_envio = 0
 service_request_id = None
+ultima_lat = None
+ultima_lon = None
+
+
+def limpar_buffer_gps():
+    """Descarta bytes antigos/corrompidos no RX (comum após HTTP demorado)."""
+    if gps is None:
+        return
+    while gps.any():
+        gps.read(gps.any())
 
 
 def conectar_wifi():
@@ -69,10 +81,13 @@ def nmea_para_decimal(valor, direcao):
     return decimal
 
 
-def parsear_gpgga(linha):
-    partes = linha.split(",")
+def parsear_gga(linha):
+    # Módulos GNSS modernos usam $GNGGA; GPS puro usa $GPGGA
+    if not (linha.startswith("$GPGGA") or linha.startswith("$GNGGA")):
+        return None
 
-    if len(partes) < 6 or not linha.startswith("$GPGGA"):
+    partes = linha.split(",")
+    if len(partes) < 7:
         return None
 
     if partes[6] in ("", "0"):
@@ -113,6 +128,8 @@ def iniciar_rota():
         service_request_id = None
         estado = False
         print("Erro ao iniciar rota:", erro)
+    finally:
+        limpar_buffer_gps()
 
 
 def enviar_localizacao(latitude, longitude):
@@ -139,33 +156,45 @@ def enviar_localizacao(latitude, longitude):
         response.close()
     except Exception as erro:
         print("Erro ao enviar:", erro)
+    finally:
+        limpar_buffer_gps()
 
 
-def processar_coordenadas(lat_dec, lon_dec):
-    global ultimo_envio
+def atualizar_coordenadas(lat_dec, lon_dec):
+    global ultima_lat, ultima_lon
 
-    if service_request_id is None:
-        return
-
+    ultima_lat = lat_dec
+    ultima_lon = lon_dec
     print("Lat:", lat_dec)
     print("Lon:", lon_dec)
     print("---")
 
+
+def tentar_enviar_se_devido():
+    global ultimo_envio
+
+    if service_request_id is None or ultima_lat is None:
+        return
+
     agora = time()
     if agora - ultimo_envio >= INTERVALO_ENVIO_S:
-        enviar_localizacao(lat_dec, lon_dec)
+        enviar_localizacao(ultima_lat, ultima_lon)
         ultimo_envio = agora
 
 
 def ligar_sistema():
-    global ultimo_envio
+    global ultimo_envio, ultima_lat, ultima_lon
     ultimo_envio = 0
+    ultima_lat = None
+    ultima_lon = None
     iniciar_rota()
 
 
 def desligar_sistema():
-    global service_request_id
+    global service_request_id, ultima_lat, ultima_lon
     service_request_id = None
+    ultima_lat = None
+    ultima_lon = None
     print("Sistema desligado")
 
 
@@ -193,20 +222,22 @@ while True:
         led.value(1)
 
         if SIMULAR_GPS:
-            processar_coordenadas(LAT_SIM, LON_SIM)
+            atualizar_coordenadas(LAT_SIM, LON_SIM)
+            tentar_enviar_se_devido()
             sleep(1)
-        elif gps.any():
-            linha = gps.readline()
-            if not linha:
-                continue
+        else:
+            # Consome todas as linhas disponíveis para não atrasar o buffer
+            while gps.any():
+                linha = gps.readline()
+                if not linha:
+                    break
 
-            linha = linha.decode("ascii", "ignore").strip()
-
-            if linha.startswith("$GPGGA"):
-                resultado = parsear_gpgga(linha)
+                linha = linha.decode("ascii", "ignore").strip()
+                resultado = parsear_gga(linha)
                 if resultado:
-                    lat_dec, lon_dec = resultado
-                    processar_coordenadas(lat_dec, lon_dec)
+                    atualizar_coordenadas(resultado[0], resultado[1])
+
+            tentar_enviar_se_devido()
     else:
         led.value(0)
 
